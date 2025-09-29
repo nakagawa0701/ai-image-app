@@ -1,0 +1,14 @@
+{
+  "name": "ai-image-app",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["app/*"],
+  "scripts": {
+    "dev": "concurrently -n BE,FE -c blue,green \"npm run dev -w backend\" \"npm run dev -w frontend\"",
+    "build": "npm run -ws build",
+    "lint": "echo \"(任意) 後で eslint を入れる\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+}
