@@ -1,12 +1,25 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import { api_generate, type ImageSize } from './lib/api'
+import { onMounted, ref } from 'vue'
+import {
+  _generate_image,
+  _save_image,
+  _list_images,
+  type _image_size,
+  type _generate_result
+} from './lib/api'
+
+type _image_state = Partial<_generate_result> & {
+  dataUrl: string
+  is_saving: boolean
+  is_saved: boolean
+  save_error: string | null
+}
 
 const _prompt = ref('')
-const _size = ref<ImageSize>('1024x1024')
+const _size = ref<_image_size>('1024x1024')
 const _loading = ref(false)
 const _error = ref<string | null>(null)
-const _images = ref<string[]>([])
+const _images = ref<_image_state[]>([])
 
 const _on_generate = async () => {
   _error.value = null
@@ -16,14 +29,44 @@ const _on_generate = async () => {
   }
   _loading.value = true
   try {
-    const url = await api_generate(_prompt.value.trim(), _size.value)
-    _images.value = [url] // v1は1枚で十分
+    const result = await _generate_image(_prompt.value.trim(), _size.value)
+    _images.value.unshift({ ...result, is_saving: false, is_saved: false, save_error: null }) // v1は1枚で十分
   } catch (e: any) {
     _error.value = e?.message ?? '生成に失敗しました'
   } finally {
     _loading.value = false
   }
 }
+
+const _on_save = async (image: _image_state) => {
+  if (!image.base64 || !image.mime) return
+  image.is_saving = true
+  image.save_error = null
+  try {
+    const saved = await _save_image(image.base64, image.mime)
+    image.is_saved = true
+    image.dataUrl = saved.url // URLを永続的なものに更新
+    image.base64 = undefined // 不要になったので消す
+  } catch (e: any) {
+    image.save_error = e?.message ?? '保存に失敗しました'
+  } finally {
+    image.is_saving = false
+  }
+}
+
+onMounted(async () => {
+  try {
+    const images = await _list_images()
+    _images.value = images.map((img) => ({
+      dataUrl: img.url,
+      is_saved: true,
+      is_saving: false,
+      save_error: null
+    }))
+  } catch (e: any) {
+    _error.value = e?.message ?? '画像の読み込みに失敗しました'
+  }
+})
 </script>
 
 <template>
@@ -48,13 +91,19 @@ const _on_generate = async () => {
     </div>
 
     <div class="_grid">
-      <img
-        v-for="(img, i) in _images"
-        :key="i"
-        :src="img"
-        alt="generated"
-        class="_thumb"
-      />
+      <div v-for="(img, i) in _images" :key="i" class="_thumb_wrap">
+        <img :src="img.dataUrl" alt="generated" class="_thumb" />
+        <div class="_thumb_actions">
+          <button
+            class="_save_btn"
+            :disabled="img.is_saving || img.is_saved"
+            @click="_on_save(img)"
+          >
+            {{ img.is_saving ? '保存中…' : img.is_saved ? '保存済み' : '保存' }}
+          </button>
+          <div v-if="img.save_error" class="_error">{{ img.save_error }}</div>
+        </div>
+      </div>
     </div>
 
     <div class="_hint">次のステップで「マスク編集」ページを足します。</div>
@@ -106,12 +155,26 @@ const _on_generate = async () => {
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr))
   gap: 12px
 
+._thumb_wrap
+  display: grid
+  gap: 8px
+
 ._thumb
   width: 100%
   aspect-ratio: 1
   object-fit: cover
   border: 1px solid #333
   border-radius: 10px
+
+._thumb_actions
+  display: grid
+  gap: 4px
+
+._save_btn
+  padding: 8px
+  border-radius: 6px
+  border: 1px solid #666
+  width: 100%
 
 ._hint
   opacity: .7
