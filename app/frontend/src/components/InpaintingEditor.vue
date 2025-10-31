@@ -1,310 +1,265 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { onMounted, onBeforeUnmount, ref } from 'vue'
+import { _edit_image } from '../lib/api'
 
-const props = defineProps<{
-  dataUrl: string
-}>()
+type _props = {
+  filename: string              // 保存済み元画像のファイル名（例: 1234-....png）
+  imageUrl: string              // 元画像のURL（/api/files/...）
+  defaultPrompt?: string
+  defaultBrush?: number         // px
+  feather?: number              // 合成の境界ぼかし(px)
+  padding?: number              // 生成パッチの余白(px)
+  autosave?: boolean            // trueなら編集結果をedits/へ保存
+}
+const props = withDefaults(defineProps<_props>(), {
+  defaultPrompt: '',
+  defaultBrush: 28,
+  feather: 2,
+  padding: 12,
+  autosave: true
+})
 
 const emit = defineEmits<{
   (e: 'close'): void
-  (e: 'regenerate', payload: { mask: string; prompt: string }): void
+  (e: 'done', payload: { dataUrl: string, saved?: { url: string, filename: string, mime: string } | null }): void
 }>()
 
-const _new_prompt = ref('')
-const _brush_size = ref(40)
+const _img_el = ref<HTMLImageElement | null>(null)
+const _overlay = ref<HTMLCanvasElement | null>(null) // 画面上に重ねる赤塗り可視用
+const _mask = ref<HTMLCanvasElement | null>(null)    // 実体の白黒マスク（送信）
+const _container = ref<HTMLDivElement | null>(null)
 
-const _image_ref = ref<HTMLImageElement | null>(null)
-const _canvas_ref = ref<HTMLCanvasElement | null>(null)
-const _ctx = ref<CanvasRenderingContext2D | null>(null)
-
+const _prompt = ref(props.defaultPrompt)
+const _brush = ref(props.defaultBrush)
 const _is_drawing = ref(false)
-const _last_pos = ref<{ x: number; y: number } | null>(null)
+let _rect: DOMRect | null = null
+let _scaleX = 1
+let _scaleY = 1
 
-// Canvasのセットアップ
-const _setup_canvas = () => {
-  const img = _image_ref.value
-  const canvas = _canvas_ref.value
-  if (!img || !canvas) return
+function _resize_canvases() {
+  const img = _img_el.value
+  const ov = _overlay.value
+  if (!img || !ov) return
+  const { width, height } = img.getBoundingClientRect()
+  ov.width = Math.round(width)
+  ov.height = Math.round(height)
 
-  // 画像の表示サイズに合わせてCanvasの解像度を設定
-  const rect = img.getBoundingClientRect()
-  canvas.width = rect.width
-  canvas.height = rect.height
+  const m = _mask.value!
+  m.width = img.naturalWidth
+  m.height = img.naturalHeight
 
-  const ctx = canvas.getContext('2d')
-  if (!ctx) return
-  _ctx.value = ctx
+  _rect = img.getBoundingClientRect()
+  _scaleX = img.naturalWidth / width
+  _scaleY = img.naturalHeight / height
 
-  // ブラシを白に設定
-  ctx.fillStyle = '#FFFFFF'
-  ctx.strokeStyle = '#FFFFFF'
-  ctx.lineWidth = _brush_size.value
-  ctx.lineCap = 'round'
-  ctx.lineJoin = 'round'
+  const ctx = ov.getContext('2d')!
+  ctx.clearRect(0, 0, ov.width, ov.height)
 }
 
-// リサイズ時にCanvasを再セットアップするためのObserver
-let _resize_observer: ResizeObserver | null = null
-onMounted(() => {
-  const container = _image_ref.value?.parentElement
-  if (container) {
-    _resize_observer = new ResizeObserver(() => {
-      _setup_canvas()
-    })
-    _resize_observer.observe(container)
-  }
-})
-onUnmounted(() => {
-  _resize_observer?.disconnect()
-})
+function _draw_point(clientX: number, clientY: number) {
+  const ov = _overlay.value!, m = _mask.value!
+  if (!_rect) return
 
-// dataUrlが変更されたら(画像が読み込まれたら)Canvasをセットアップ
-watch(() => props.dataUrl, () => {
-  const img = new Image()
-  img.onload = () => _setup_canvas()
-  img.src = props.dataUrl
-}, { once: true })
+  const x = clientX - _rect.left
+  const y = clientY - _rect.top
 
-// ブラシサイズが変更されたらContextに反映
-watch(_brush_size, (size) => {
-  if (_ctx.value) {
-    _ctx.value.lineWidth = size
-  }
-})
+  // 可視レイヤ（赤）
+  const ctxV = ov.getContext('2d')!
+  ctxV.fillStyle = 'rgba(255,0,0,.45)'
+  ctxV.beginPath()
+  ctxV.arc(x, y, _brush.value / 2, 0, Math.PI * 2)
+  ctxV.fill()
 
-const _get_canvas_pos = (e: MouseEvent) => {
-  const canvas = _canvas_ref.value
-  if (!canvas) return { x: 0, y: 0 }
-  const rect = canvas.getBoundingClientRect()
-  return {
-    x: e.clientX - rect.left,
-    y: e.clientY - rect.top
-  }
+  // 実マスク（白=編集、黒=非編集）
+  const ctxM = m.getContext('2d')!
+  ctxM.fillStyle = '#ffffff'
+  ctxM.beginPath()
+  // 半径スケーリング（任意：平均スケールで安定）
+  const r = Math.round((_brush.value / 2) * ((_scaleX + _scaleY) / 2))
+  ctxM.arc(Math.round(x * _scaleX), Math.round(y * _scaleY), r, 0, Math.PI * 2)
+  ctxM.fill()
 }
 
-const _start_draw = (e: MouseEvent) => {
+function _on_pointer_down(e: PointerEvent) {
   _is_drawing.value = true
-  _last_pos.value = _get_canvas_pos(e)
+  _overlay.value!.setPointerCapture(e.pointerId)
+  _draw_point(e.clientX, e.clientY)
 }
-
-const _stop_draw = () => {
+function _on_pointer_move(e: PointerEvent) {
+  if (!_is_drawing.value) return
+  _draw_point(e.clientX, e.clientY)
+}
+function _on_pointer_up(e: PointerEvent) {
   _is_drawing.value = false
-  _last_pos.value = null
+  _overlay.value!.releasePointerCapture(e.pointerId)
 }
 
-const _draw = (e: MouseEvent) => {
-  if (!_is_drawing.value || !_ctx.value || !_last_pos.value) return
-  const pos = _get_canvas_pos(e)
-  _ctx.value.beginPath()
-  _ctx.value.moveTo(_last_pos.value.x, _last_pos.value.y)
-  _ctx.value.lineTo(pos.x, pos.y)
-  _ctx.value.stroke()
-  _last_pos.value = pos
+function _clear_mask() {
+  const ov = _overlay.value!, m = _mask.value!
+  const v = ov.getContext('2d')!, t = m.getContext('2d')!
+  v.clearRect(0, 0, ov.width, ov.height)
+  t.fillStyle = '#000000'
+  t.fillRect(0, 0, m.width, m.height)
 }
 
-const _clear_mask = () => {
-  const canvas = _canvas_ref.value
-  const ctx = _ctx.value
-  if (canvas && ctx) {
-    ctx.clearRect(0, 0, canvas.width, canvas.height)
+const _working = ref(false)
+
+async function _apply_edit() {
+  const m = _mask.value!
+  const maskDataUrl = m.toDataURL('image/png') // 白=編集対象、黒=非編集
+  if (!props.filename) {
+    alert('元画像が保存されていません（ファイル名が必要です）')
+    return
+  }
+  if (!_prompt.value.trim()) {
+    alert('編集内容（プロンプト）を入力してください')
+    return
+  }
+  try {
+    _working.value = true
+    const res = await _edit_image({
+      filename: props.filename,
+      maskDataUrl,
+      prompt: _prompt.value.trim(),
+      feather: props.feather,
+      padding: props.padding,
+      save: props.autosave
+    })
+    emit('done', { dataUrl: res.dataUrl, saved: res.saved || null })
+  } catch (e: any) {
+    alert(`マスク編集に失敗しました: ${e?.message ?? e}`)
+  } finally {
+    _working.value = false
   }
 }
 
-const _on_regenerate = () => {
-  const canvas = _canvas_ref.value
-  if (!canvas) return
+onMounted(() => {
+  const m = _mask.value!
+  const ctx = m.getContext('2d')!
+  const img = _img_el.value!
+  const onload = () => {
+    _resize_canvases()
+    ctx.fillStyle = '#000000'
+    ctx.fillRect(0, 0, m.width, m.height)
+  }
+  if (img.complete && img.naturalWidth) onload()
+  else img.addEventListener('load', onload, { once: true })
 
-  // バックグラウンドで黒背景のマスクを生成する
-  const tempCanvas = document.createElement('canvas')
-  tempCanvas.width = canvas.width
-  tempCanvas.height = canvas.height
-  const tempCtx = tempCanvas.getContext('2d')
-  if (!tempCtx) return
+  const ro = new ResizeObserver(() => _resize_canvases())
+  ro.observe(_container.value!)
+  _cleanup = () => ro.disconnect()
+})
 
-  // 黒で塗りつぶし
-  tempCtx.fillStyle = '#000000'
-  tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height)
-
-  // ユーザーが描画した白いマスクを上に描画
-  tempCtx.drawImage(canvas, 0, 0)
-
-  const mask = tempCanvas.toDataURL('image/png')
-  emit('regenerate', { mask, prompt: _new_prompt.value })
-}
+let _cleanup: null | (() => void) = null
+onBeforeUnmount(() => { if (_cleanup) _cleanup() })
 </script>
 
 <template>
-  <div class="_overlay">
-    <div class="_editor">
-      <div class="_header">
-        <h2 class="_title">マスク編集</h2>
-        <button class="_close_btn" @click="emit('close')">×</button>
+  <div class="_editor_wrap">
+    <div class="_toolbar">
+      <input class="_prompt_input" v-model="_prompt" placeholder="例: 左上の雲を消して青空に、自然に" aria-label="編集内容（プロンプト）" />
+      <div class="_brush_ctrl">
+        <label class="_label">ブラシ</label>
+        <input class="_brush_input" type="range" min="4" max="128" v-model.number="_brush" aria-label="ブラシサイズ" />
+        <span class="_brush_px">{{ _brush }}px</span>
       </div>
-
-      <div class="_main_view">
-        <div class="_img_container">
-          <img ref="_image_ref" :src="dataUrl" alt="editing image" class="_img" />
-          <canvas
-            ref="_canvas_ref"
-            class="_canvas"
-            @mousedown="_start_draw"
-            @mouseup="_stop_draw"
-            @mouseleave="_stop_draw"
-            @mousemove="_draw"
-          ></canvas>
-        </div>
-
-        <div class="_toolbar">
-          <div class="_tool">
-            <label for="brush_size">ブラシサイズ: {{ _brush_size }}</label>
-            <input
-              type="range"
-              id="brush_size"
-              min="10"
-              max="100"
-              v-model="_brush_size"
-              class="_slider"
-            />
-          </div>
-          <div class="_tool">
-            <button class="_btn _btn_clear" @click="_clear_mask">マスクをクリア</button>
-          </div>
-          <div class="_tool">
-            <label for="new_prompt">修正プロンプト（マスク部分の指示）</label>
-            <input
-              id="new_prompt"
-              v-model="_new_prompt"
-              placeholder="例: サングラスをかけている"
-              class="_prompt_input"
-            />
-          </div>
-        </div>
-      </div>
-
-      <div class="_footer">
-        <button class="_btn _btn_cancel" @click="emit('close')">キャンセル</button>
-        <button class="_btn _btn_regen" @click="_on_regenerate">再生成</button>
-      </div>
+      <button class="_btn" @click="_clear_mask">マスクを消去</button>
+      <button class="_btn _primary" :disabled="_working" @click="_apply_edit">{{ _working ? '処理中…' : 'この内容で編集する' }}</button>
+      <button class="_btn" @click="$emit('close')">閉じる</button>
     </div>
+
+    <div class="_stage" ref="_container">
+      <img ref="_img_el" class="_base_img" :src="imageUrl" alt="編集元の画像" />
+      <canvas
+        ref="_overlay"
+        class="_overlay"
+        @pointerdown="_on_pointer_down"
+        @pointermove="_on_pointer_move"
+        @pointerup="_on_pointer_up"
+        @pointercancel="_on_pointer_up"
+        @pointerleave="_on_pointer_up"
+      />
+      <!-- 実マスク: 画面には表示しない -->
+      <canvas ref="_mask" class="_mask_canvas" />
+    </div>
+
+    <div class="_hint">赤く塗った部分が「編集対象」になります（内部では白=編集、黒=非編集のマスクPNGとして送信）。</div>
   </div>
 </template>
 
 <style scoped lang="sass">
-._overlay
-  position: fixed
-  top: 0
-  left: 0
-  right: 0
-  bottom: 0
-  background: rgba(0,0,0,0.8)
+._editor_wrap
   display: grid
-  place-items: center
-  z-index: 200
-
-._editor
-  background: #282828
-  border-radius: 16px
-  border: 1px solid #444
-  width: 90vw
-  height: 90vh
-  max-width: 1400px
-  display: flex
-  flex-direction: column
-
-._header
-  display: flex
-  justify-content: space-between
-  align-items: center
-  padding: 12px 20px
-  border-bottom: 1px solid #444
-
-._title
-  font-size: 18px
-  font-weight: 700
-
-._close_btn
-  background: none
-  border: none
-  color: #fff
-  font-size: 24px
-  cursor: pointer
-
-._main_view
-  flex: 1
-  display: grid
-  grid-template-columns: 1fr 300px
-  gap: 20px
-  padding: 20px
-  overflow: hidden
-
-._img_container
-  position: relative
-  display: grid
-  place-items: center
-  background: #111
-  border-radius: 10px
-  overflow: hidden
-
-._img
-  max-width: 100%
-  max-height: 100%
-  object-fit: contain
-
-._canvas
-  position: absolute
-  top: 0
-  left: 0
-  cursor: crosshair
+  gap: 12px
 
 ._toolbar
   display: flex
-  flex-direction: column
-  gap: 24px
-  padding: 10px
-
-._tool
-  display: grid
+  flex-wrap: wrap
   gap: 8px
-
-._slider
-  width: 100%
+  align-items: center
 
 ._prompt_input
+  flex: 1
+  min-width: 260px
   padding: 10px
   border: 1px solid #444
   border-radius: 8px
   background: #111
   color: #eee
-  width: 100%
 
-._btn_clear
-  padding: 10px
-  border-radius: 8px
-  border: 1px solid #666
-  background: #333
-  color: #fff
-
-._footer
+._brush_ctrl
   display: flex
-  justify-content: flex-end
-  gap: 12px
-  padding: 16px 20px
-  border-top: 1px solid #444
+  align-items: center
+  gap: 6px
+
+._label
+  font-size: 12px
+  opacity: .8
+
+._brush_input
+  width: 140px
+
+._brush_px
+  width: 56px
+  font-size: 12px
+  text-align: right
+  opacity: .7
 
 ._btn
-  padding: 12px 20px
+  padding: 10px 14px
   border-radius: 8px
-  border: none
-  font-size: 16px
-  font-weight: 700
+  border: 1px solid #666
+  background: #222
+  color: #eee
   cursor: pointer
 
-._btn_cancel
-  background: #444
-  color: #fff
-  border: 1px solid #666
+._primary
+  border-color: #4a8
+  background: #274
 
-._btn_regen
-  background: #3a7fff
-  color: #fff
+._stage
+  position: relative
+  width: 100%
+  max-width: 720px
+  border: 1px solid #333
+  border-radius: 10px
+  overflow: hidden
+
+._base_img
+  display: block
+  width: 100%
+  height: auto
+
+._overlay
+  position: absolute
+  inset: 0
+  touch-action: none
+  cursor: crosshair
+
+._mask_canvas
+  display: none
+
+._hint
+  font-size: 12px
+  opacity: .7
 </style>
