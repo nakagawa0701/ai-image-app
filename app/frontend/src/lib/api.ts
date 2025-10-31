@@ -46,3 +46,24 @@ export async function _list_images(): Promise<_listed_image[]> {
   const json = await res.json()
   return json || []
 }
+
+export async function _inpaint_image(
+  image: string, // dataURL
+  mask: string, // dataURL
+  prompt: string
+): Promise<_generate_result> {
+  const res = await fetch('/api/inpaint', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ image, mask, prompt })
+  })
+  if (!res.ok) throw new Error(`inpaint_failed (${res.status})`)
+  const json = await res.json()
+  if (!json?.image_base64) throw new Error('no_image_base64')
+  return {
+    dataUrl: `data:${json.mime || 'image/png'};base64,${json.image_base64}`,
+    base64: json.image_base64,
+    url: json?.file?.url,
+    mime: json.mime
+  }
+}

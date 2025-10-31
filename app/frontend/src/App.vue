@@ -4,9 +4,12 @@ import {
   _generate_image,
   _save_image,
   _list_images,
+  _inpaint_image,
   type _image_size,
   type _generate_result
 } from './lib/api'
+import ImagePreview from './components/ImagePreview.vue'
+import InpaintingEditor from './components/InpaintingEditor.vue'
 
 type _image_state = Partial<_generate_result> & {
   dataUrl: string
@@ -20,6 +23,8 @@ const _size = ref<_image_size>('1024x1024')
 const _loading = ref(false)
 const _error = ref<string | null>(null)
 const _images = ref<_image_state[]>([])
+const _pending_image = ref<_image_state | null>(null)
+const _editing_image = ref<_image_state | null>(null)
 
 const _on_generate = async () => {
   _error.value = null
@@ -30,7 +35,7 @@ const _on_generate = async () => {
   _loading.value = true
   try {
     const result = await _generate_image(_prompt.value.trim(), _size.value)
-    _images.value.unshift({ ...result, is_saving: false, is_saved: false, save_error: null }) // v1は1枚で十分
+    _pending_image.value = { ...result, is_saving: false, is_saved: false, save_error: null }
   } catch (e: any) {
     _error.value = e?.message ?? '生成に失敗しました'
   } finally {
@@ -38,8 +43,11 @@ const _on_generate = async () => {
   }
 }
 
-const _on_save = async (image: _image_state) => {
-  if (!image.base64 || !image.mime) return
+// プレビューで「完成」を押した
+const _on_preview_complete = async () => {
+  const image = _pending_image.value
+  if (!image || !image.base64 || !image.mime) return
+
   image.is_saving = true
   image.save_error = null
   try {
@@ -47,10 +55,43 @@ const _on_save = async (image: _image_state) => {
     image.is_saved = true
     image.dataUrl = saved.url // URLを永続的なものに更新
     image.base64 = undefined // 不要になったので消す
+    _images.value.unshift(image)
   } catch (e: any) {
     image.save_error = e?.message ?? '保存に失敗しました'
   } finally {
     image.is_saving = false
+    _pending_image.value = null // プレビューを閉じる
+  }
+}
+
+// プレビューで「修正」を押した
+const _on_preview_modify = () => {
+  _editing_image.value = _pending_image.value
+  _pending_image.value = null
+}
+
+// エディタを閉じた
+const _on_editor_close = () => {
+  _editing_image.value = null
+}
+
+// エディタで「再生成」を押した
+const _on_editor_regenerate = async (payload: { mask: string; prompt: string }) => {
+  const image_to_edit = _editing_image.value
+  if (!image_to_edit) return
+
+  _error.value = null
+  _loading.value = true
+  _editing_image.value = null // エディタを閉じる
+
+  try {
+    const result = await _inpaint_image(image_to_edit.dataUrl, payload.mask, payload.prompt)
+    // 結果をプレビューに戻す
+    _pending_image.value = { ...result, is_saving: false, is_saved: false, save_error: null }
+  } catch (e: any) {
+    _error.value = e?.message ?? '再生成に失敗しました'
+  } finally {
+    _loading.value = false
   }
 }
 
@@ -71,6 +112,19 @@ onMounted(async () => {
 
 <template>
   <div class="_layout">
+    <ImagePreview
+      v-if="_pending_image"
+      :data-url="_pending_image.dataUrl"
+      @complete="_on_preview_complete"
+      @modify="_on_preview_modify"
+    />
+    <InpaintingEditor
+      v-if="_editing_image"
+      :data-url="_editing_image.dataUrl"
+      @close="_on_editor_close"
+      @regenerate="_on_editor_regenerate"
+    />
+
     <h1 class="_title">画像生成</h1>
 
     <div class="_form">
@@ -93,20 +147,9 @@ onMounted(async () => {
     <div class="_grid">
       <div v-for="(img, i) in _images" :key="i" class="_thumb_wrap">
         <img :src="img.dataUrl" alt="generated" class="_thumb" />
-        <div class="_thumb_actions">
-          <button
-            class="_save_btn"
-            :disabled="img.is_saving || img.is_saved"
-            @click="_on_save(img)"
-          >
-            {{ img.is_saving ? '保存中…' : img.is_saved ? '保存済み' : '保存' }}
-          </button>
-          <div v-if="img.save_error" class="_error">{{ img.save_error }}</div>
-        </div>
+        <!-- 保存ボタンはプレビューフローに移行したため削除 -->
       </div>
     </div>
-
-    <div class="_hint">次のステップで「マスク編集」ページを足します。</div>
   </div>
 </template>
 
