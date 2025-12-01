@@ -3,12 +3,23 @@ export type _generate_result = { dataUrl: string; mime: string }
 export type _save_result = { url: string; filename: string; mime: string }
 
 export type _image_item = {
-  filename: string
   url: string
+  filename: string
   mime: string
-  bytes: number
-  mtime: string
+  mtime: number                // ← ここを単一真実源（SSOT）に
   kind: 'generated' | 'edits'
+}
+
+// ヘルパー：fetch 失敗メッセージの抽出
+async function _ensure_ok(res: Response, fallback: string) {
+  if (res.ok) return
+  const txt = await res.text().catch(() => '')
+  try {
+    const j = JSON.parse(txt)
+    throw new Error(j?.error || `${fallback} (${res.status})`)
+  } catch {
+    throw new Error(txt || `${fallback} (${res.status})`)
+  }
 }
 
 export async function _edit_image(params: {
@@ -49,48 +60,76 @@ export async function _edit_image(params: {
   }
 }
 
-export async function _generate_image(prompt: string, _size: _image_size = '1024x1024'): Promise<_generate_result> {
+export async function _generate_image(args: { prompt: string; size?: string }): Promise<{ dataUrl: string; mime: string }> {
   const res = await fetch('/api/generate', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ prompt, size: _size }) // サイズは目安（OpenRouterは強制不可）
+    body: JSON.stringify({ prompt: args.prompt, size: args.size })
   })
-  if (!res.ok) throw new Error(`generate_failed (${res.status})`)
-  const json = await res.json()
-  if (!json?.image_base64 || !json?.mime) throw new Error('no_image_base64')
-  return { dataUrl: `data:${json.mime};base64,${json.image_base64}`, mime: json.mime }
+  await _ensure_ok(res, 'generate_failed')
+  const j = await res.json() as { image_base64?: string; mime?: string }
+  if (!j.image_base64) throw new Error('no_image_in_response')
+  const mime = j.mime || 'image/png'
+  return { dataUrl: `data:${mime};base64,${j.image_base64}`, mime }
 }
 
-export async function _save_image(dataUrl: string): Promise<_save_result> {
-  const res = await fetch('/api/save', {
+export async function _save_image(
+  input: string,
+  opts?: { dest?: 'generated' | 'edits' }
+): Promise<{ url: string; filename: string; mime: string }> {
+  const dest = opts?.dest ?? 'generated'
+
+  let payload: any
+  if (/^data:image\//i.test(input)) {
+    payload = { data_url: input, dest }
+  } else if (/^\/api\/files\//.test(input) || /^https?:\/\/.+\/api\/files\//.test(input)) {
+    payload = { url: input, dest }
+  } else {
+    throw new Error('not_data_url_or_api_file_url')
+  }
+
+  const r = await fetch('/api/save', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ dataUrl })
+    body: JSON.stringify(payload)
   })
-  if (!res.ok) throw new Error(`save_failed (${res.status})`)
-  const json = await res.json()
-  if (!json?.file?.url || !json?.file?.filename || !json?.file?.mime) throw new Error('invalid_save_response')
-  return { url: json.file.url, filename: json.file.filename, mime: json.file.mime }
+  const j = await r.json()
+  if (!r.ok) throw new Error(j?.error || 'save_failed')
+  return j
 }
 
-export async function _list_images(params?: { kind?: 'generated'|'edits'|'all', limit?: number, offset?: number }): Promise<_image_item[]> {
+
+
+
+export async function _list_images(args: { kind: 'all' | 'generated' | 'edits'; limit?: number }): Promise<_image_item[]> {
   const q = new URLSearchParams()
-  if (params?.kind) q.set('kind', params.kind)
-  if (params?.limit) q.set('limit', String(params.limit))
-  if (params?.offset) q.set('offset', String(params.offset))
-  const res = await fetch(`/api/images?${q.toString()}`)
-  if (!res.ok) throw new Error(`list_images_failed (${res.status})`)
-  const json = await res.json()
-  if (!Array.isArray(json?.items)) return []
-  return json.items as _image_item[]
+  q.set('kind', args.kind)
+  if (args.limit) q.set('limit', String(args.limit))
+  const res = await fetch(`/api/images?${q}`)
+  await _ensure_ok(res, 'list_failed')
+  const raw = await res.json() as Array<{ url: string; filename: string; mime: string; mtime: string | number; kind: 'generated' | 'edits' }>
+  return raw.map(it => {
+    // 文字列でも数値でも、必ず number(ms) に
+    const mtime =
+      typeof it.mtime === 'number' ? it.mtime
+      : (/^\d+$/.test(it.mtime) ? Number(it.mtime) : Date.parse(it.mtime))
+    return { ...it, mtime: isFinite(mtime) ? mtime : Date.now() }
+  })
 }
 
 export async function _delete_image(filename: string): Promise<{ ok: true; filename: string }> {
   const res = await fetch(`/api/images/${encodeURIComponent(filename)}`, { method: 'DELETE' })
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '')
-    try { const j = JSON.parse(txt); throw new Error(j?.error || `delete_failed (${res.status})`) }
-    catch { throw new Error(txt || `delete_failed (${res.status})`) }
-  }
+  await _ensure_ok(res, 'delete_failed')
   return res.json()
+}
+
+export async function _upload_data_url(dataUrl: string): Promise<{ url: string; filename: string; mime: string }> {
+  const res = await fetch('/api/upload', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ data_url: dataUrl })
+  })
+  await _ensure_ok(res, 'upload_failed')
+  const j = await res.json()
+  return j.file
 }

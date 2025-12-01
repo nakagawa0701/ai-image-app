@@ -1,3 +1,4 @@
+// app/backend/lib/image-io.ts
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -48,11 +49,25 @@ export async function readImageByName(name: string): Promise<{ buf: Buffer; mime
       const ext = path.extname(name).slice(1).toLowerCase()
       const mime = MIME_BY_EXT[ext] ?? 'image/png'
       return { buf, mime, from: p.from }
-    } catch {/* try next */}
+    } catch {
+      /* try next */
+    }
   }
   throw new Error('file_not_found')
 }
 
+/** 生成系（storage/generated）に保存 */
+export async function saveToGenerated(img: Img) {
+  await ensureDir(DIR_GENERATED)
+  const ext = EXT_BY_MIME[img.mime] ?? 'png'
+  const id = randomUUID()
+  const filename = `${id}.${ext}`
+  const filepath = path.join(DIR_GENERATED, filename)
+  await fs.writeFile(filepath, Buffer.from(img.base64, 'base64'))
+  return { id, filename, url: `/api/files/${filename}`, mime: img.mime }
+}
+
+/** 編集系（storage/edits）に保存 */
 export async function saveToEdits(img: Img) {
   await ensureDir(DIR_EDITS)
   const ext = EXT_BY_MIME[img.mime] ?? 'png'

@@ -1,6 +1,41 @@
 import sharp from 'sharp'
 import { bufferToPngDataUrl } from '../../lib/image-io.js'
 
+type MeanRGB = { r: number; g: number; b: number }
+
+async function _meanRgb(buf: Buffer): Promise<MeanRGB> {
+  const s = await sharp(buf).stats()
+  return {
+    r: s.channels[0].mean,
+    g: s.channels[1].mean,
+    b: s.channels[2].mean
+  }
+}
+
+// パッチの平均にゲインを掛けて周辺平均に寄せる（過補正防止でclamp）
+async function colorMatchTo(patchRgb: Buffer, target: MeanRGB): Promise<Buffer> {
+  const src = await _meanRgb(patchRgb)
+  // 0除算を避けつつ安全域で係数算出（0.6〜1.6の間にクランプ）
+  const gx = (t: number, s: number) => Math.max(0.6, Math.min(1.6, (t + 1e-3) / (s + 1e-3)))
+  const kr = gx(target.r, src.r), kg = gx(target.g, src.g), kb = gx(target.b, src.b)
+  // 3x3対角行列で線形ゲイン
+  return sharp(patchRgb)
+    .recomb([[kr,0,0],[0,kg,0],[0,0,kb]])
+    .toBuffer()
+}
+
+// bboxの周辺（N pxのリング）を抜き出して平均色を計算
+async function _surroundingMean(original: Buffer, imgW: number, imgH: number, bbox: BBox, ring = 8): Promise<MeanRGB> {
+  const left = Math.max(0, bbox.left - ring)
+  const top = Math.max(0, bbox.top - ring)
+  const right = Math.min(imgW, bbox.left + bbox.width + ring)
+  const bottom = Math.min(imgH, bbox.top + bbox.height + ring)
+
+  // 周辺リング：外矩形から内矩形を引くのが理想だが、簡易に外矩形の平均でも十分効く
+  const crop = await sharp(original).extract({ left, top, width: right - left, height: bottom - top }).toBuffer()
+  return _meanRgb(crop)
+}
+
 export type BBox = { left: number; top: number; width: number; height: number }
 
 function clamp(n: number, min: number, max: number) { return Math.min(Math.max(n, min), max) }
@@ -121,13 +156,21 @@ export async function strictComposite(
     .toColorspace('srgb')       // ← OK: srgb に統一
     .toBuffer()
 
+    const metapatch = await sharp(originalBuf).metadata()
+    const imgwpatch = metapatch.width!, imghpatch = metapatch.height!
+
+    // ... patchRgb を作成した後に挿入
+    const neighMean = await _surroundingMean(originalBuf, imgwpatch, imghpatch, bbox, 8)
+    const patchMatched = await colorMatchTo(patchRgb, neighMean)
+
+
   // 4) raw(1ch) α → PNG（joinChannel は画像入力を想定）
   const alphaPng = await sharp(blurred, { raw: { width: bbox.width, height: bbox.height, channels: 1 } })
     .png()
     .toBuffer()
 
   // 5) RGB + α(PNG) → RGBA パッチ
-  const patchRgba = await sharp(patchRgb)
+  const patchRgba = await sharp(patchMatched)
     .joinChannel(alphaPng)
     .png()
     .toBuffer()
@@ -184,17 +227,36 @@ export function scaleBBoxTo(
 
 
 /** bbox切り出し → 最大辺maxPxに収まるよう縮小 → dataURL返却 */
-export async function makePatchDataUrlScaled(originalBuf: Buffer, bbox: BBox, maxPx = 1024): Promise<string> {
-  const patch = await sharp(originalBuf)
-    .extract({ left: bbox.left, top: bbox.top, width: bbox.width, height: bbox.height })
-
-  const meta = await patch.metadata()
+export async function makePatchDataUrlScaled(originalBuf: Buffer, bbox: BBox, maxEdge = 1536): Promise<string> {
+  const base = sharp(originalBuf).extract({ left: bbox.left, top: bbox.top, width: bbox.width, height: bbox.height })
+  const meta = await base.metadata()
   const w = meta.width!, h = meta.height!
-  const scale = Math.min(1, maxPx / Math.max(w, h))
+  const scale = Math.min(1, maxEdge / Math.max(w, h))
 
-  const out = scale < 1
-    ? await patch.resize({ width: Math.round(w * scale), height: Math.round(h * scale), fit: 'inside' }).png().toBuffer()
-    : await patch.png().toBuffer()
+  // 歪み禁止: contain（余白は透明）で拡大 → モデルには“正しい見かけ”を渡す
+  const up = await base
+    .toColorspace('srgb')
+    .resize({
+      width: Math.round(w * scale),
+      height: Math.round(h * scale),
+      fit: 'inside',           // ← 歪めない
+      withoutEnlargement: false
+    })
+    .png()
+    .toBuffer()
 
-  return bufferToPngDataUrl(out)
+  return `data:image/png;base64,${up.toString('base64')}`
+}
+
+// 1ch raw α を「ぼかし→しきい値」で 1〜2px膨張させる
+export async function inflateAlpha1ch(alpha: Buffer, w: number, h: number, px = 1): Promise<Buffer> {
+  if (px <= 0) return alpha
+  // ぼかして閾値で白を広げる（ソフト膨張）
+  const blurred = await sharp(alpha, { raw: { width: w, height: h, channels: 1 } })
+    .blur(px)                 // 半径px
+    .raw().toBuffer()
+  const out = Buffer.allocUnsafe(w * h)
+  // 128を境に2値化（0/255）
+  for (let i = 0; i < out.length; i++) out[i] = blurred[i] >= 128 ? 255 : 0
+  return out
 }

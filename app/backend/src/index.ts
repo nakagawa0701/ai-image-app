@@ -10,7 +10,9 @@ import { randomUUID } from 'node:crypto'
 
 import { registerEditRoutes } from './routes/edit'
 import { registerImagesRoutes } from './routes/images'
-import { DIR_GENERATED, DIR_EDITS, isSafeFileName } from '../lib/image-io' // removed MIME_BY_EXT import (not exported)
+import { DIR_GENERATED, DIR_EDITS, isSafeFileName } from '../lib/image-io'
+import { registerUploadRoutes } from './routes/upload'
+import { registerSaveRoutes } from './routes/save'
 
 
 type _img = { mime: string; base64: string }
@@ -18,6 +20,8 @@ type _img = { mime: string; base64: string }
 const app = new Hono()
   .use('*', logger())
   .use('*', cors())
+  registerUploadRoutes(app)
+  registerSaveRoutes(app)
 
 // ---------------- 共通ユーティリティ（重複排除） ----------------
 const _storage_root = path.resolve(process.cwd(), 'storage')
@@ -145,3 +149,5 @@ app.post('/api/save', async (c) => {
 const port = Number(process.env.PORT || 8787)
 serve({ fetch: app.fetch, port })
 console.log(`[backend] http://localhost:${port}`)
+
+export default app

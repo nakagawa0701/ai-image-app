@@ -8,6 +8,7 @@ import {
   makePatchDataUrlScaled,
   resizeAlphaTo,
   scaleBBoxTo
+, inflateAlpha1ch
 } from '../services/inpaint'
 import {
   parseDataUrl,
@@ -42,7 +43,8 @@ export function registerEditRoutes(app: Hono) {
       const maskBuf = Buffer.from(mask.base64, 'base64')
 
       stage = 'mask_to_bbox'
-      const { fullAlpha, width: maskW, height: maskH } = await computeEditAlpha(maskBuf)
+      let { fullAlpha, width: maskW, height: maskH } = await computeEditAlpha(maskBuf)
+      fullAlpha = await inflateAlpha1ch(fullAlpha, maskW, maskH, 1)
       const b0 = bboxFromAlpha(fullAlpha, maskW, maskH)
       if (!b0) return c.json({ error: 'empty_mask', stage }, 400)
       const bboxMaskSpace = padBBox(b0, maskW, maskH, padding)
